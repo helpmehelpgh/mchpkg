@@ -1,277 +1,223 @@
-# model/regression.py
-import warnings
-from typing import Tuple, Optional, Iterable
+# pkg_name/model/regression.py
+from __future__ import annotations
+import math
+from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
-from scipy import stats
 
 
 class LinearRegression:
     """
-    PyTorch-based Linear Regression (one variable)
+    A minimal PyTorch-based Linear Regression for one variable.
 
     Model: y = w1 * x + w0
-    Loss:  Mean Squared Error (MSE)
-    Optimizer: SGD
+    Loss : Mean Squared Error (MSE)
 
-    This class includes:
-      - gradient-based training (fit) with optional test set and R^2 reporting
-      - forward/predict helpers
-      - training history of w0, w1, and loss for plotting
-      - (optional) confidence intervals & regression band plot (kept from your code)
+    Assignment requirements covered:
+      - __init__(learning_rate, n_epochs) sets optimizer=SGD and loss=MSE
+      - forward(x) computes y
+      - fit(train) trains; optionally accepts test set and computes R^2 on test
+      - predict(x) predicts AnnualProduction given BCR
+      - analysis() creates a single figure containing:
+          (i) data + fitted line,
+          (ii) loss vs. epoch,
+          (iii) w1 history,
+          (iv) w0 history
+      - stores w0, w1, and loss histories during training
     """
 
-    def __init__(self, learning_rate: float = 0.01, max_epochs: int = 1000,
-                 tolerance: float = 1e-6):
-        self.learning_rate = learning_rate
-        self.max_epochs = int(max_epochs)
+    def __init__(
+        self,
+        learning_rate: float = 1e-2,
+        n_epochs: int = 1000,
+        tolerance: float = 1e-6,
+        seed: Optional[int] = None,
+    ):
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+        self.learning_rate = float(learning_rate)
+        self.n_epochs = int(n_epochs)
         self.tolerance = float(tolerance)
 
-        # parameters (torch Parameters so autograd tracks them)
-        self.w1 = nn.Parameter(torch.randn(1, requires_grad=True))  # slope
-        self.w0 = nn.Parameter(torch.randn(1, requires_grad=True))  # intercept
+        # Parameters
+        self.w1 = nn.Parameter(torch.randn(1, requires_grad=True))
+        self.w0 = nn.Parameter(torch.randn(1, requires_grad=True))
 
-        # optimizer + loss
+        # Optimizer and loss
         self.criterion = nn.MSELoss()
         self.optimizer = optim.SGD([self.w1, self.w0], lr=self.learning_rate)
 
-        # buffers set during fit
-        self.X_train: Optional[torch.Tensor] = None
-        self.y_train: Optional[torch.Tensor] = None
-        self.n_samples: Optional[int] = None
+        # Training artifacts
+        self.loss_history: list[float] = []
+        self.w1_history: list[float] = []
+        self.w0_history: list[float] = []
 
-        # stats for CIs
-        self.residual_sum_squares: Optional[float] = None
-        self.X_mean: Optional[float] = None
-        self.X_var: Optional[float] = None
+        # Bookkeeping
+        self._fitted: bool = False
+        self._train_r2: Optional[float] = None
+        self._test_r2: Optional[float] = None
 
-        # training history
-        self.w0_hist: list[float] = []
-        self.w1_hist: list[float] = []
-        self.loss_hist: list[float] = []
+        # Cache of the last train data (for plotting)
+        self._X_train: Optional[np.ndarray] = None
+        self._y_train: Optional[np.ndarray] = None
 
-        self.fitted: bool = False
+    # (b) forward
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w1 * x + self.w0
 
-    # ---------- core model ----------
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        """Compute ŷ = w1 * X + w0. X shape: (N,) or (N,1)"""
-        if X.ndim == 2 and X.shape[1] == 1:
-            X = X.squeeze(1)
-        return self.w1 * X + self.w0
+    @staticmethod
+    def _to_tensor_1d(x: np.ndarray | list | torch.Tensor) -> torch.Tensor:
+        if isinstance(x, torch.Tensor):
+            t = x
+        else:
+            t = torch.tensor(x, dtype=torch.float32)
+        return t.view(-1)
 
+    @staticmethod
+    def _r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        y_true = y_true.reshape(-1)
+        y_pred = y_pred.reshape(-1)
+        ss_res = float(np.sum((y_true - y_pred) ** 2))
+        ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+        return 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+    # (c) fit
     def fit(
         self,
-        X_train: np.ndarray,
-        y_train: np.ndarray,
-        X_test: Optional[np.ndarray] = None,
-        y_test: Optional[np.ndarray] = None,
+        X_train: np.ndarray | list | torch.Tensor,
+        y_train: np.ndarray | list | torch.Tensor,
+        X_test: Optional[np.ndarray | list | torch.Tensor] = None,
+        y_test: Optional[np.ndarray | list | torch.Tensor] = None,
         verbose: bool = False,
-    ) -> Optional[float]:
-        """
-        Train on (X_train, y_train). If test data are provided,
-        compute & print R^2 on the test set and return it.
-        """
-        # tensors
-        self.X_train = torch.tensor(np.asarray(X_train), dtype=torch.float32).reshape(-1)
-        self.y_train = torch.tensor(np.asarray(y_train), dtype=torch.float32).reshape(-1)
-        self.n_samples = int(self.X_train.numel())
+    ) -> "LinearRegression":
+        x = self._to_tensor_1d(X_train)
+        y = self._to_tensor_1d(y_train)
 
-        # stats for CIs
-        x_np = self.X_train.numpy()
-        self.X_mean = float(np.mean(x_np))
-        self.X_var = float(np.var(x_np, ddof=1)) if self.n_samples > 1 else 0.0
+        self._X_train = x.detach().cpu().numpy()
+        self._y_train = y.detach().cpu().numpy()
 
-        prev_loss = float("inf")
-        self.w0_hist.clear(); self.w1_hist.clear(); self.loss_hist.clear()
-
-        for epoch in range(self.max_epochs):
+        prev_loss = math.inf
+        for epoch in range(1, self.n_epochs + 1):
             self.optimizer.zero_grad()
-            y_pred = self.forward(self.X_train)
-            loss = self.criterion(y_pred, self.y_train)
+            y_pred = self.forward(x)
+            loss = self.criterion(y_pred, y)
             loss.backward()
             self.optimizer.step()
 
-            # record history
-            self.loss_hist.append(float(loss.item()))
-            self.w0_hist.append(float(self.w0.detach().item()))
-            self.w1_hist.append(float(self.w1.detach().item()))
+            # store histories
+            L = loss.item()
+            self.loss_history.append(L)
+            self.w1_history.append(float(self.w1.detach().cpu().numpy()))
+            self.w0_history.append(float(self.w0.detach().cpu().numpy()))
 
-            if verbose and (epoch % max(1, self.max_epochs // 10) == 0 or epoch == self.max_epochs - 1):
-                print(f"[{epoch+1:4d}/{self.max_epochs}] "
-                      f"loss={self.loss_hist[-1]:.6f}  "
-                      f"w0={self.w0_hist[-1]:.6f}  w1={self.w1_hist[-1]:.6f}")
+            if verbose and (epoch % max(1, self.n_epochs // 10) == 0 or epoch == 1):
+                print(f"[{epoch:5d}/{self.n_epochs}] loss={L:.6f} w1={self.w1.item():.6f} w0={self.w0.item():.6f}")
 
-            # early stopping
-            if abs(prev_loss - self.loss_hist[-1]) < self.tolerance:
+            # simple early stopping on loss change
+            if abs(prev_loss - L) < self.tolerance:
                 if verbose:
-                    print(f"Converged after {epoch+1} epochs")
+                    print(f"Converged at epoch {epoch} (Δloss < {self.tolerance:g}).")
                 break
-            prev_loss = self.loss_hist[-1]
+            prev_loss = L
 
-        # RSS for CIs
+        # compute train R^2
         with torch.no_grad():
-            residuals = self.y_train - self.forward(self.X_train)
-            self.residual_sum_squares = float(torch.sum(residuals ** 2))
+            yhat_tr = self.forward(x).detach().cpu().numpy()
+        self._train_r2 = self._r2_score(self._y_train, yhat_tr)
 
-        self.fitted = True
-
-        # R^2 on test (if provided)
-        r2 = None
+        # optionally compute test R^2 (assignment calls for computing R^2 on test data)
         if X_test is not None and y_test is not None:
-            y_pred_test = self.predict(np.asarray(X_test))
-            y_test_np = np.asarray(y_test).reshape(-1)
-            ss_res = float(np.sum((y_test_np - y_pred_test) ** 2))
-            ss_tot = float(np.sum((y_test_np - y_test_np.mean()) ** 2))
-            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-            print(f"R^2 (test) = {r2:.6f}")
-        return r2
+            xt = self._to_tensor_1d(X_test)
+            yt = self._to_tensor_1d(y_test)
+            with torch.no_grad():
+                yhat_te = self.forward(xt).detach().cpu().numpy()
+            self._test_r2 = self._r2_score(yt.detach().cpu().numpy(), yhat_te)
 
-    @torch.no_grad()
-    def predict(self, X: Iterable[float] | np.ndarray) -> np.ndarray:
-        """Predict for new X. Returns shape (N,) numpy array."""
-        if not self.fitted:
-            raise ValueError("Model must be fitted before predicting.")
-        X_t = torch.tensor(np.asarray(X), dtype=torch.float32).reshape(-1)
-        y_hat = self.forward(X_t)
-        return y_hat.cpu().numpy().reshape(-1)
+        self._fitted = True
+        return self
 
-    def get_parameters(self) -> Tuple[float, float]:
-        """Return (w1, w0)."""
-        if not self.fitted:
-            raise ValueError("Model must be fitted before accessing parameters.")
-        return float(self.w1.item()), float(self.w0.item())
+    # (d) predict
+    def predict(self, X: np.ndarray | list | torch.Tensor) -> np.ndarray:
+        if not self._fitted:
+            raise RuntimeError("Call fit(...) before predict(...).")
+        x = self._to_tensor_1d(X)
+        with torch.no_grad():
+            yhat = self.forward(x).detach().cpu().numpy()
+        return yhat
 
-    # ---------- analysis / plotting per HW spec ----------
-    def analysis_plot(self, X_train: np.ndarray, y_train: np.ndarray,
-                      title: str = "Training Summary"):
-        """
-        Create a figure with 3 subplots:
-          (1) scatter of training data + fitted line
-          (2) parameter traces (w0, w1)
-          (3) loss curve
-        """
-        if not self.fitted:
-            raise ValueError("Fit the model before calling analysis_plot().")
-
-        X = np.asarray(X_train).reshape(-1)
-        y = np.asarray(y_train).reshape(-1)
-
-        # fitted line over range
-        x_line = np.linspace(X.min(), X.max(), 300, dtype=np.float32)
-        y_line = self.predict(x_line)
-
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
-
-        # (1) data + regression line
-        axes[0].scatter(X, y, s=14, alpha=0.7, label="train data")
-        axes[0].plot(x_line, y_line, lw=2.5, label="fitted line")
-        axes[0].set_xlabel("BCR (x)")
-        axes[0].set_ylabel("AnnualProduction (y)")
-        axes[0].legend()
-        axes[0].grid(True, ls="--", alpha=0.3)
-
-        # (2) parameter traces
-        axes[1].plot(self.w0_hist, label="w0 (intercept)")
-        axes[1].plot(self.w1_hist, label="w1 (slope)")
-        axes[1].set_xlabel("epoch")
-        axes[1].set_ylabel("value")
-        axes[1].legend()
-        axes[1].grid(True, ls="--", alpha=0.3)
-
-        # (3) loss curve
-        axes[2].plot(self.loss_hist)
-        axes[2].set_xlabel("epoch")
-        axes[2].set_ylabel("MSE loss")
-        axes[2].grid(True, ls="--", alpha=0.3)
-
-        fig.suptitle(title, y=1.02, fontsize=12)
-        fig.tight_layout()
-        return fig
-
-    # ---------- optional extras from your code ----------
-    def parameter_confidence_intervals(self, confidence_level: float = 0.95) -> dict:
-        """(Optional) CIs for w1 and w0 using classic formulas."""
-        if not self.fitted:
-            raise ValueError("Fit the model before computing confidence intervals.")
-
-        if self.n_samples is None or self.n_samples < 3:
-            raise ValueError("Not enough samples for CI computation.")
-
-        df = self.n_samples - 2
-        alpha = 1 - confidence_level
-        t_crit = stats.t.ppf(1 - alpha/2, df)
-
-        mse = (self.residual_sum_squares or 0.0) / df
-        se_reg = np.sqrt(mse)
-
-        if self.X_var == 0:
-            warnings.warn("X variance is zero; CI for w1 is undefined.")
-            se_w1 = np.inf
-            se_w0 = np.inf
-        else:
-            se_w1 = se_reg / np.sqrt(self.n_samples * self.X_var)
-            se_w0 = se_reg * np.sqrt(1/self.n_samples + (self.X_mean**2)/(self.n_samples * self.X_var))
-
-        w1_val, w0_val = self.get_parameters()
-        w1_ci = (w1_val - t_crit * se_w1, w1_val + t_crit * se_w1)
-        w0_ci = (w0_val - t_crit * se_w0, w0_val + t_crit * se_w0)
-
+    def summary(self) -> Dict[str, Any]:
+        if not self._fitted:
+            raise RuntimeError("Model not fitted.")
         return {
-            "w_1_confidence_interval": w1_ci,
-            "w_0_confidence_interval": w0_ci,
-            "confidence_level": confidence_level,
-            "standard_errors": {
-                "se_w1": se_w1,
-                "se_w0": se_w0,
-                "se_regression": se_reg,
+            "parameters": {"w1 (slope)": float(self.w1.item()), "w0 (intercept)": float(self.w0.item())},
+            "training": {
+                "epochs_run": len(self.loss_history),
+                "final_loss": self.loss_history[-1] if self.loss_history else None,
+                "train_R2": self._train_r2,
+                "test_R2": self._test_r2,
             },
         }
 
-    def plot_regression_with_confidence_band(
-        self,
-        confidence_level: float = 0.95,
-        figsize: tuple[int, int] = (10, 6),
-        title: Optional[str] = None,
-    ):
-        """(Optional) your original CI band plot."""
-        if not self.fitted:
-            raise ValueError("Fit the model before plotting.")
+    # (e) analysis plots on one figure
+    def analysis(self, title: Optional[str] = None, figsize: Tuple[int, int] = (12, 9)) -> plt.Figure:
+        """
+        Creates ONE figure with 4 subplots:
+          1) scatter of training data + fitted line
+          2) loss vs. epoch
+          3) w1 vs. epoch
+          4) w0 vs. epoch
+        """
+        if not self._fitted:
+            raise RuntimeError("Fit the model before calling analysis().")
+        if self._X_train is None or self._y_train is None:
+            raise RuntimeError("Training data cache is empty.")
 
-        fig, ax = plt.subplots(figsize=figsize)
-        X_np = self.X_train.numpy()
-        y_np = self.y_train.numpy()
+        X = self._X_train
+        y = self._y_train
 
-        X_range = np.linspace(X_np.min(), X_np.max(), 200)
-        y_pred = self.predict(X_range)
+        xx = np.linspace(X.min(), X.max(), 200)
+        yy = self.predict(xx)
 
-        df = self.n_samples - 2
-        alpha = 1 - confidence_level
-        t_crit = stats.t.ppf(1 - alpha/2, df)
-        mse = (self.residual_sum_squares or 0.0) / df
-        se_reg = np.sqrt(mse)
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.25)
 
-        X_center = X_range - (self.X_mean or 0.0)
-        if self.X_var == 0:
-            se_pred = np.full_like(X_range, np.inf, dtype=float)
-        else:
-            se_pred = se_reg * np.sqrt(1/self.n_samples + X_center**2 / (self.n_samples * self.X_var))
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax1.scatter(X, y, alpha=0.7, label="Data")
+        ax1.plot(xx, yy, linewidth=2, label=f"Fit: y = {self.w1.item():.3f}x + {self.w0.item():.3f}")
+        ax1.set_xlabel("BCR (x)")
+        ax1.set_ylabel("AnnualProduction (y)")
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        ax1.set_title("Data & Fitted Line")
 
-        margin = t_crit * se_pred
-        ax.scatter(X_np, y_np, alpha=0.6, label="data")
-        ax.plot(X_range, y_pred, "r-", lw=2, label="fitted line")
-        ax.fill_between(X_range, y_pred - margin, y_pred + margin, alpha=0.25, color="red",
-                        label=f"{int(confidence_level*100)}% band")
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax2.plot(np.arange(1, len(self.loss_history) + 1), self.loss_history, linewidth=2)
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("Loss (MSE)")
+        ax2.grid(True, alpha=0.3)
+        ax2.set_title("Loss vs. Epoch")
 
-        w1_val, w0_val = self.get_parameters()
-        ax.set_xlabel("X")
-        ax.set_ylabel("y")
-        ax.set_title(title or f"Linear Regression: y = {w1_val:.3f}x + {w0_val:.3f}")
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-        plt.tight_layout()
+        ax3 = fig.add_subplot(gs[1, 0])
+        ax3.plot(np.arange(1, len(self.w1_history) + 1), self.w1_history, linewidth=2)
+        ax3.set_xlabel("Epoch")
+        ax3.set_ylabel("w1 (slope)")
+        ax3.grid(True, alpha=0.3)
+        ax3.set_title("w1 during Training")
+
+        ax4 = fig.add_subplot(gs[1, 1])
+        ax4.plot(np.arange(1, len(self.w0_history) + 1), self.w0_history, linewidth=2)
+        ax4.set_xlabel("Epoch")
+        ax4.set_ylabel("w0 (intercept)")
+        ax4.grid(True, alpha=0.3)
+        ax4.set_title("w0 during Training")
+
+        if title:
+            fig.suptitle(title, y=1.02, fontsize=14)
         return fig
 
